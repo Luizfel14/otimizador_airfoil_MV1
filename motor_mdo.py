@@ -3,10 +3,10 @@ import os
 import tempfile
 import numpy as np
 from math import comb
-from scipy.optimize import minimize, least_squares
+from scipy.optimize import minimize, least_squares, differential_evolution
 from scipy.interpolate import interp1d
 
-def bezier_curve(control_points, n_points=100):
+def bezier_curve(control_points, n_points=120):
     n = len(control_points) - 1
     beta = np.linspace(0, np.pi, n_points)
     t = 0.5 * (1 - np.cos(beta))
@@ -33,7 +33,7 @@ def load_selig_from_lines(lines):
     lower[:, 0] = np.clip(lower[:, 0], 0.0, 1.0)
     return upper, lower
 
-def fit_initial_bezier(upper_orig, lower_orig, degree=6):
+def fit_initial_bezier(upper_orig, lower_orig, degree=8):
     beta_cp = np.linspace(0, np.pi, degree)
     x_fixed_interior = 0.5 * (1 - np.cos(beta_cp[1:-1]))
     x_cp = np.concatenate(([0.0, 0.0], x_fixed_interior, [1.0]))
@@ -46,11 +46,11 @@ def fit_initial_bezier(upper_orig, lower_orig, degree=6):
 
         def res_fn(y_p):
             cp = np.column_stack((x_cp, np.concatenate(([0.0], y_p, [y_te]))))
-            c = bezier_curve(cp, 120)
+            c = bezier_curve(cp, 130)
             w = np.where(c[:, 0] < 0.05, 2.5, 1.0)
             return (c[:, 1] - interp(c[:, 0])) * w
 
-        res = least_squares(res_fn, y_init, max_nfev=1500)
+        res = least_squares(res_fn, y_init, max_nfev=2000)
         return x_cp, res.x, y_te
 
     x_cp, yu_init, yu_te = fit_side(upper_orig, True)
@@ -82,7 +82,7 @@ def check_mdo_geometry(upper_curve, lower_curve, mdo_specs):
 
     return (penalty == 0.0), penalty
 
-def run_xfoil_polar(dat_path, reynolds, alpha_seq=(0.0, 14.0, 1.0), ncrit=7):
+def run_xfoil_polar(dat_path, reynolds, alpha_seq=(0.0, 18.0, 1.5), ncrit=7):
     polar_file = dat_path + ".pol"
     if os.path.exists(polar_file):
         os.remove(polar_file)
@@ -91,14 +91,18 @@ def run_xfoil_polar(dat_path, reynolds, alpha_seq=(0.0, 14.0, 1.0), ncrit=7):
 G F
 
 LOAD {dat_path}
+PPAR
+N 220
+
+
 PANE
 OPER
 VISC {reynolds}
-M 0.05
+M 0.04
 VPAR
 N {ncrit}
 
-ITER 120
+ITER 150
 PACC
 {polar_file}
 
@@ -113,7 +117,7 @@ QUIT
             input=commands.encode("ascii"),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=6
+            timeout=8
         )
     except Exception:
         return None
@@ -134,15 +138,16 @@ QUIT
                     continue
     os.remove(polar_file)
 
-    if len(data) < 5:
+    if len(data) < 6:
         return None
     return np.array(data)
 
-def run_optimization(upper_orig, lower_orig, re_list, mdo_specs, weights, max_fev=250, progress_callback=None):
-    x_cp, yu_base, yu_te, yl_base, yl_te = fit_initial_bezier(upper_orig, lower_orig, degree=6)
+def run_optimization(upper_orig, lower_orig, re_list, mdo_specs, weights, bezier_degree=8, max_fev=450, progress_callback=None):
+    x_cp, yu_base, yu_te, yl_base, yl_te = fit_initial_bezier(upper_orig, lower_orig, degree=bezier_degree)
     n_vars_side = len(yu_base)
     x0 = np.concatenate((yu_base, yl_base))
-    bounds = [(val - 0.035, val + 0.035) for val in x0]
+
+    bounds = [(val - 0.06, val + 0.06) for val in x0]
 
     best_score = -1e9
     best_x = x0.copy()
@@ -157,8 +162,8 @@ def run_optimization(upper_orig, lower_orig, re_list, mdo_specs, weights, max_fe
         cp_u = np.column_stack((x_cp, np.concatenate(([0.0], yu, [yu_te]))))
         cp_l = np.column_stack((x_cp, np.concatenate(([0.0], yl, [yl_te]))))
 
-        upper_curve = bezier_curve(cp_u, n_points=90)
-        lower_curve = bezier_curve(cp_l, n_points=90)
+        upper_curve = bezier_curve(cp_u, n_points=105)
+        lower_curve = bezier_curve(cp_l, n_points=105)
 
         is_valid, geo_penalty = check_mdo_geometry(upper_curve, lower_curve, mdo_specs)
         if not is_valid:
@@ -173,20 +178,29 @@ def run_optimization(upper_orig, lower_orig, re_list, mdo_specs, weights, max_fe
 
         total_fitness = 0.0
         for re in re_list:
-            polar = run_xfoil_polar(tmp_path, re, alpha_seq=(0.0, 14.0, 1.0), ncrit=7)
+            polar = run_xfoil_polar(tmp_path, re, alpha_seq=(0.0, 18.0, 1.5), ncrit=7)
             if polar is None:
                 os.remove(tmp_path)
                 return 100.0
 
-            cl_max = np.max(polar[:, 1])
-            ld_max = np.max(polar[:, 1] / polar[:, 2])
-            cm_min = np.min(polar[:, 3])
+            cl_vals = polar[:, 1]
+            cd_vals = polar[:, 2]
+            cm_vals = polar[:, 3]
 
+            cl_max = np.max(cl_vals)
+
+            mask_voo = (cl_vals >= 1.1) & (cl_vals <= 1.7)
+            if np.any(mask_voo):
+                ld_operacional = np.mean(cl_vals[mask_voo] / cd_vals[mask_voo])
+            else:
+                ld_operacional = np.max(cl_vals / cd_vals) * 0.7
+
+            cm_min = np.min(cm_vals)
             cm_penalty = 0.0
             if cm_min < mdo_specs["min_cm"]:
-                cm_penalty = 20.0 * (mdo_specs["min_cm"] - cm_min) ** 2
+                cm_penalty = 25.0 * (mdo_specs["min_cm"] - cm_min) ** 2
 
-            re_score = (weights["cl_max"] * cl_max) + (weights["ld_max"] * (ld_max / 50.0)) - cm_penalty
+            re_score = (weights["cl_max"] * cl_max) + (weights["ld_max"] * (ld_operacional / 45.0)) - cm_penalty
             total_fitness += re_score / len(re_list)
 
         os.remove(tmp_path)
@@ -203,22 +217,47 @@ def run_optimization(upper_orig, lower_orig, re_list, mdo_specs, weights, max_fe
 
     base_score = -objective(x0)
 
-    minimize(
+    # Estágio 1: Exploração global (Differential Evolution)
+    pop_size = 10
+    n_dim = len(x0)
+    init_pop = np.clip(
+        x0 + np.random.uniform(-0.025, 0.025, size=(pop_size, n_dim)),
+        [b[0] for b in bounds],
+        [b[1] for b in bounds]
+    )
+    init_pop[0] = x0
+
+    max_gen = max(5, int((max_fev * 0.65) // pop_size))
+    differential_evolution(
         objective,
-        x0,
-        method="Powell",
         bounds=bounds,
-        options={"maxiter": 50, "maxfev": max_fev, "ftol": 1e-4}
+        init=init_pop,
+        maxiter=max_gen,
+        tol=1e-3,
+        polish=False
     )
 
-    u_base = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yu_base, [yu_te])))), 100)
-    l_base = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yl_base, [yl_te])))), 100)
+    # Estágio 2: Refinamento local (Powell)
+    rem_fev = max(80, max_fev - eval_count[0])
+    minimize(
+        objective,
+        best_x,
+        method="Powell",
+        bounds=bounds,
+        options={"maxiter": 45, "maxfev": rem_fev, "ftol": 1e-4}
+    )
+
+    u_base = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yu_base, [yu_te])))), 120)
+    l_base = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yl_base, [yl_te])))), 120)
     base_coords = np.vstack((u_base[::-1], l_base[1:]))
 
     yu_opt = best_x[:n_vars_side]
     yl_opt = best_x[n_vars_side:]
-    u_opt = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yu_opt, [yu_te])))), 100)
-    l_opt = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yl_opt, [yl_te])))), 100)
+    u_opt = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yu_opt, [yu_te])))), 120)
+    l_opt = bezier_curve(np.column_stack((x_cp, np.concatenate(([0.0], yl_opt, [yl_te])))), 120)
     opt_coords = np.vstack((u_opt[::-1], l_opt[1:]))
 
-    return base_coords, opt_coords, base_score, best_score, history
+    cp_u_opt = np.column_stack((x_cp, np.concatenate(([0.0], yu_opt, [yu_te]))))
+    cp_l_opt = np.column_stack((x_cp, np.concatenate(([0.0], yl_opt, [yl_te]))))
+
+    return base_coords, opt_coords, base_score, best_score, history, (cp_u_opt, cp_l_opt)
